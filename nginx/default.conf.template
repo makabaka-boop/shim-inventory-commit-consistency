@@ -1,0 +1,19 @@
+server {
+    listen       ${WEB_PORT};
+    server_name  _;
+
+    root   /usr/share/nginx/html;
+    index  index.html;
+
+    # Long-cache hashed build assets.
+    location /assets/ {
+        expires 7d;
+        add_header Cache-Control "public, max-age=604800, immutable";
+        try_files $uri =404;
+    }
+
+    # Single-page app: serve index for unknown routes.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

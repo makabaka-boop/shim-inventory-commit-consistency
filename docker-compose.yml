@@ -1,0 +1,38 @@
+# Compose stack:
+#   web     - statically serves the built React page (default port 8080)
+#   verify  - one-shot acceptance service (type check + vitest + build)
+#
+# Override the host port with WEB_PORT, e.g.:
+#   WEB_PORT=9090 docker compose up web
+# Run acceptance once:
+#   docker compose run --rm verify
+
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: shim-reachability-web:latest
+    environment:
+      # Port nginx listens on inside the container; overridable.
+      WEB_PORT: ${WEB_PORT:-8080}
+    ports:
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${WEB_PORT}/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: shim-reachability-verify:latest
+    # The verify stage's CMD runs the full acceptance command once
+    # (type check, Vitest exactness suite, production build) and exits 0
+    # only if everything passes.
+    restart: "no"
+    profiles:
+      - verify
