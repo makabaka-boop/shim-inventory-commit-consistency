@@ -166,6 +166,101 @@ describe('repository — commit protocol', () => {
     expect(reloaded.batches[0].status).toBe('draft')
   })
 
+  it('COMMIT read-back mismatch + rollback write failure: failed candidate is demoted, never served as committed', () => {
+    const storage = new FakeStorage()
+    const repo = new InventoryRepository(storage)
+    let batches = makeBatch()
+    repo.commit(batches[0]) // v1 draft committed
+
+    batches = startCounting(batches, batches[0].id)
+    const liveKey = `${STORAGE_PREFIX}${batches[0].id}`
+    const tampered = JSON.stringify({
+      version: CURRENT_RECORD_VERSION,
+      committed: true,
+      savedAt: 9,
+      batch: { tampered: true },
+    })
+    // 1st live write (candidate) lands but reads afterwards lie;
+    // 2nd live write (rollback restore) throws;
+    // 3rd live write (demote to committed:false) lands and reads heal.
+    let liveWrites = 0
+    let lieOnRead = false
+    const flaky: StorageLike = {
+      getItem: (key) => (key === liveKey && lieOnRead ? tampered : storage.getItem(key)),
+      setItem: (key, value) => {
+        if (key === liveKey) {
+          liveWrites += 1
+          if (liveWrites === 1) lieOnRead = true
+          else lieOnRead = false
+          if (liveWrites === 2) throw new Error('injected rollback failure')
+        }
+        storage.setItem(key, value)
+      },
+      removeItem: (key) => storage.removeItem(key),
+      keys: () => storage.keys(),
+    }
+    const flakyRepo = new InventoryRepository(flaky)
+
+    let err: unknown
+    try {
+      flakyRepo.commit(batches[0])
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(StorageWriteError)
+    expect((err as StorageWriteError).stage).toBe('commit')
+
+    // Refresh over the real bytes: the failed advance must NOT come back as
+    // an effective "counting" record — it is isolated as an unfinished write.
+    const reloaded = new InventoryRepository(storage).load()
+    expect(reloaded.batches).toHaveLength(0)
+    expect(reloaded.quarantined).toHaveLength(1)
+    expect(reloaded.quarantined[0].storageKey).toBe(liveKey)
+    expect(reloaded.quarantined[0].reason).toBe('uncommitted_record')
+
+    // Once storage is healthy, the exact same candidate commits cleanly.
+    const healthyRepo = new InventoryRepository(storage)
+    healthyRepo.commit(batches[0])
+    const after = healthyRepo.load()
+    expect(after.batches).toHaveLength(1)
+    expect(after.batches[0].status).toBe('counting')
+    expect(after.quarantined).toHaveLength(0)
+  })
+
+  it('COMMIT quota failure + rollback failure: intact previous record is left untouched', () => {
+    const storage = new FakeStorage()
+    const repo = new InventoryRepository(storage)
+    let batches = makeBatch()
+    repo.commit(batches[0]) // v1 draft committed
+
+    batches = startCounting(batches, batches[0].id)
+    const liveKey = `${STORAGE_PREFIX}${batches[0].id}`
+    // Live write and rollback restore both fail (setItem is atomic, so the
+    // previous committed bytes are still on disk); the verify read must
+    // detect that and skip demotion.
+    let liveWrites = 0
+    const flaky: StorageLike = {
+      getItem: (key) => storage.getItem(key),
+      setItem: (key, value) => {
+        if (key === liveKey) {
+          liveWrites += 1
+          if (liveWrites <= 2) throw quotaError()
+        }
+        storage.setItem(key, value)
+      },
+      removeItem: (key) => storage.removeItem(key),
+      keys: () => storage.keys(),
+    }
+    const flakyRepo = new InventoryRepository(flaky)
+    expect(() => flakyRepo.commit(batches[0])).toThrow(StorageWriteError)
+
+    // The previous committed version survived and is still served.
+    const reloaded = new InventoryRepository(storage).load()
+    expect(reloaded.batches).toHaveLength(1)
+    expect(reloaded.batches[0].status).toBe('draft')
+    expect(reloaded.quarantined).toHaveLength(0)
+  })
+
   it('failed writes never leak: repository stays internally consistent across a full lifecycle with flaky storage', () => {
     const storage = new FakeStorage()
     const repo = new InventoryRepository(storage)

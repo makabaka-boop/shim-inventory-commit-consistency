@@ -12,7 +12,11 @@
  *               the live record is ever touched.
  *   2. COMMIT — write the same payload with committed:true to the live key,
  *               read it back and require deep equality. Any failure triggers
- *               a best-effort rollback to the previously stored raw string.
+ *               a best-effort rollback to the previously stored raw string;
+ *               if the rollback write itself fails and the previous bytes
+ *               cannot be verified on disk, the record is demoted to
+ *               committed:false so a later load() isolates it as an
+ *               unfinished write instead of serving the failed candidate.
  *   3. CLEANUP— remove the stage key.
  *
  * Only after all three steps return does the caller update React state.
@@ -235,13 +239,13 @@ export class InventoryRepository {
       this.storage.setItem(key, liveText)
     } catch (err) {
       // setItem is atomic per spec; old record should still be intact.
-      this.rollback(key, previousRaw)
+      this.rollback(key, previousRaw, batch)
       this.safeRemove(stageKey)
       throw new StorageWriteError('commit', '正式记录写入失败（可能容量不足），已保留上一版本', err)
     }
     const liveBack = this.readJson(key)
     if (liveBack === undefined || !this.envelopeMatches(liveBack, liveEnvelope)) {
-      this.rollback(key, previousRaw)
+      this.rollback(key, previousRaw, batch)
       this.safeRemove(stageKey)
       throw new StorageWriteError('commit', '正式记录写入后回读不一致，已回滚到上一版本')
     }
@@ -283,14 +287,43 @@ export class InventoryRepository {
     return removed
   }
 
-  private rollback(key: string, previousRaw: string | null): void {
+  private rollback(key: string, previousRaw: string | null, candidate: StocktakeBatch): void {
     try {
       if (previousRaw === null) this.storage.removeItem(key)
       else this.storage.setItem(key, previousRaw)
+      return
     } catch {
-      // Rollback itself failed; the underlying store is unhealthy. We never
-      // surface untrusted data as current state — callers keep their last
-      // known-good in-memory version regardless.
+      // The restore write itself failed. The live key may still hold the
+      // failed candidate with a committed:true marker — or the previous
+      // version may in fact be intact (a failed setItem is atomic per
+      // spec). Only when the previously committed bytes cannot be verified
+      // on disk is the record demoted, so a later load() can never serve
+      // the failed candidate as the effective version.
+      let previousIntact = false
+      try {
+        previousIntact = this.storage.getItem(key) === previousRaw
+      } catch {
+        previousIntact = false
+      }
+      if (previousIntact) return
+      this.demote(key, candidate)
+    }
+  }
+
+  /**
+   * Best-effort last resort when the previous version cannot be restored:
+   * overwrite the live key with the same candidate but committed:false.
+   * load() isolates such a record as `uncommitted_record` (上次写入未完成)
+   * instead of treating the failed write as the effective version, so the
+   * page, a refresh and any later operation can never disagree about which
+   * commit is authoritative. If even this write fails, the store is fully
+   * unhealthy and only the in-memory last-good version remains for this tab.
+   */
+  private demote(key: string, candidate: StocktakeBatch): void {
+    try {
+      this.storage.setItem(key, JSON.stringify(makeEnvelope(candidate, false, this.now())))
+    } catch {
+      // Nothing more can be signalled at this layer.
     }
   }
 

@@ -163,12 +163,12 @@ export class InventoryStore {
 
   private persistOne(id: string): (next: StocktakeBatch[]) => void {
     return (next) => {
-      const batch = next.find((b) => b.id === id)
-      if (!batch) throw new RuleError('BATCH_NOT_FOUND', '候选批次在提交前消失')
-      const readBack = this.repo.commit(batch)
-      // Never trust the candidate blindly: state adopts the read-back record.
-      // (It is structurally equal by the repository's deep verification.)
-      void readBack
+      const index = next.findIndex((b) => b.id === id)
+      if (index < 0) throw new RuleError('BATCH_NOT_FOUND', '候选批次在提交前消失')
+      // Never trust the candidate blindly: state adopts the record exactly as
+      // read back from the durable commit, so the mutation result, a later
+      // refresh and every follow-up operation all share one committed truth.
+      next[index] = this.repo.commit(next[index])
     }
   }
 

@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import { FakeStorage, quotaError } from './fake-storage'
-import { InventoryRepository, STORAGE_PREFIX } from './repository'
+import { CURRENT_RECORD_VERSION } from './migrations'
+import {
+  InventoryRepository,
+  STORAGE_PREFIX,
+  type StorageLike,
+} from './repository'
 import { InventoryStore } from './store'
 import type { LineDraft } from './schema'
 
@@ -136,6 +141,80 @@ describe('InventoryStore — storage failures show last good version + retry', (
     store.resolveDifference(id, line.id, 'recheck')
     expect(store.advance(id).ok).toBe(true)
     expect(store.getSnapshot().batches[0].status).toBe('completed')
+  })
+
+  it('failed advance + failed rollback never becomes effective: refresh isolates the unfinished write, retry converges', () => {
+    const storage = new FakeStorage()
+    const store = new InventoryStore(new InventoryRepository(storage))
+    store.load()
+    const created = store.createBatch({ name: '验收', lines })
+    expect(created.ok).toBe(true)
+    const id = created.id!
+
+    // Advance draft -> counting while the live write's read-back lies and
+    // the rollback restore write also fails (only that attempt is sabotaged).
+    const liveKey = `${STORAGE_PREFIX}${id}`
+    const tampered = JSON.stringify({
+      version: CURRENT_RECORD_VERSION,
+      committed: true,
+      savedAt: 9,
+      batch: { tampered: true },
+    })
+    let liveWrites = 0
+    let lieOnRead = false
+    const flaky: StorageLike = {
+      getItem: (key) => (key === liveKey && lieOnRead ? tampered : storage.getItem(key)),
+      setItem: (key, value) => {
+        if (key === liveKey) {
+          liveWrites += 1
+          if (liveWrites === 1) lieOnRead = true
+          else lieOnRead = false
+          if (liveWrites === 2) throw new Error('injected rollback failure')
+        }
+        storage.setItem(key, value)
+      },
+      removeItem: (key) => storage.removeItem(key),
+      keys: () => storage.keys(),
+    }
+    const flakyStore = new InventoryStore(new InventoryRepository(flaky))
+    flakyStore.load()
+
+    const failed = flakyStore.startCounting(id)
+    expect(failed.ok).toBe(false)
+    expect(failed.storageError?.stage).toBe('commit')
+    // The page keeps showing the last successfully committed version.
+    expect(flakyStore.getSnapshot().batches[0].status).toBe('draft')
+    expect(flakyStore.getSnapshot().failure).not.toBeNull()
+
+    // Refresh: the failed advance must not load as an effective "counting"
+    // batch — it is quarantined with an unfinished-write hint instead.
+    const refreshed = new InventoryStore(
+      new InventoryRepository(new FakeStorage(storage.dump())),
+    )
+    refreshed.load()
+    const snap = refreshed.getSnapshot()
+    expect(snap.batches).toHaveLength(0)
+    expect(snap.quarantined).toHaveLength(1)
+    expect(snap.quarantined[0].reason).toBe('uncommitted_record')
+    expect(snap.quarantined[0].detail).toContain('未完成')
+
+    // Same tab, storage healthy again: the stashed operation retries
+    // verbatim and commits; a further refresh serves exactly that record.
+    const retried = flakyStore.retry()
+    expect(retried.ok).toBe(true)
+    expect(flakyStore.getSnapshot().batches[0].status).toBe('counting')
+
+    const refreshedAgain = new InventoryStore(
+      new InventoryRepository(new FakeStorage(storage.dump())),
+    )
+    refreshedAgain.load()
+    expect(refreshedAgain.getSnapshot().quarantined).toHaveLength(0)
+    expect(refreshedAgain.getSnapshot().batches).toHaveLength(1)
+    expect(refreshedAgain.getSnapshot().batches[0].status).toBe('counting')
+
+    // Follow-up counting runs against the same committed stage.
+    const line = refreshedAgain.getSnapshot().batches[0].lines[0]
+    expect(refreshedAgain.recordCount(id, line.id, 5).ok).toBe(true)
   })
 
   it('load quarantines bad records but keeps good batches usable', () => {
