@@ -75,11 +75,29 @@ export type QuarantineReason =
   | 'invalid_migration'
   | 'invalid_batch'
   | 'uncommitted_record'
+  | 'ambiguous_commit'
+
+/**
+ * A quarantined record whose fate needs an explicit human decision. This only
+ * applies to ambiguous commits: the last "advance" call reported failure, but
+ * storage cannot prove whether the new version landed or the old one survived.
+ */
+export interface AmbiguousResolution {
+  kind: 'ambiguous_commit'
+  /** Batch id encoded in the storage key. */
+  batchId: string
+  /** What the failed push was trying to make effective (never auto-adopted). */
+  candidateStatus: BatchStatus | null
+  /** Last version known committed before the push (null = it was a create). */
+  previousStatus: BatchStatus | null
+}
 
 export interface QuarantineEntry {
   storageKey: string
   reason: QuarantineReason
   detail: string
+  /** Present when the entry can be explicitly resolved instead of purged. */
+  resolution?: AmbiguousResolution
 }
 
 export const QUARANTINE_REASON_LABEL: Record<QuarantineReason, string> = {
@@ -89,6 +107,7 @@ export const QUARANTINE_REASON_LABEL: Record<QuarantineReason, string> = {
   invalid_migration: '版本迁移失败',
   invalid_batch: '批次结构校验未通过',
   uncommitted_record: '上次写入未完成（缺少提交标记）',
+  ambiguous_commit: '上次提交结果存疑（无法确认是否已生效），已冻结',
 }
 
 /** Why a domain transition was rejected. */
@@ -100,6 +119,7 @@ export type RuleErrorCode =
   | 'UNRESOLVED_DIFFERENCES'
   | 'INVALID_NAME'
   | 'INVALID_LINE'
+  | 'AMBIGUOUS_COMMIT'
 
 export class RuleError extends Error {
   readonly code: RuleErrorCode

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { FakeStorage, quotaError } from './fake-storage'
-import { InventoryRepository, STORAGE_PREFIX } from './repository'
+import { InventoryRepository, STORAGE_PREFIX, type StorageLike } from './repository'
 import { InventoryStore } from './store'
 import type { LineDraft } from './schema'
 
@@ -172,3 +172,177 @@ describe('InventoryStore — storage failures show last good version + retry', (
     expect(store.getSnapshot().batches[0].status).toBe('completed')
   })
 })
+
+describe('InventoryStore — ambiguous advance: page, refresh, isolation and later work converge', () => {
+  /**
+   * Reproduces the reported incident:
+   *  - draft -> counting push reports failure (read-back mismatch)
+   *  - the unconfirmed counting record physically landed
+   *  - the recovery/rollback write also fails
+   */
+  function ambiguousStore(): { store: InventoryStore; storage: FakeStorage; id: string } {
+    const storage = new FakeStorage()
+    const seed = new InventoryStore(new InventoryRepository(storage))
+    seed.load()
+    const created = seed.createBatch({ name: '验收', lines })
+    expect(created.ok).toBe(true)
+    const id = created.id!
+
+    const liveKey = `${STORAGE_PREFIX}${id}`
+    let landed = false
+    const broken: StorageLike = {
+      getItem: (key) => (key === liveKey && landed ? null : storage.getItem(key)),
+      setItem: (key, value) => {
+        if (key === liveKey) {
+          if (landed) throw quotaError() // rollback write fails too
+          storage.setItem(key, value)
+          landed = true
+        } else {
+          storage.setItem(key, value)
+        }
+      },
+      removeItem: (key) => storage.removeItem(key),
+      keys: () => storage.keys(),
+    }
+    const brokenStore = new InventoryStore(new InventoryRepository(broken))
+    brokenStore.load()
+    return { store: brokenStore, storage, id }
+  }
+
+  it('failed advance keeps showing draft, freezes the batch and flags the ambiguity', () => {
+    const { store, id } = ambiguousStore()
+    const result = store.startCounting(id)
+
+    expect(result.ok).toBe(false)
+    expect(result.storageError?.indoubt).toBe(true)
+    // The page still shows the last successfully submitted record: the draft.
+    expect(store.getSnapshot().batches).toHaveLength(1)
+    expect(store.getSnapshot().batches[0].status).toBe('draft')
+    expect(store.getSnapshot().failure?.indoubt).toBe(true)
+    expect(store.getSnapshot().indoubtBatches).toContain(id)
+  })
+
+  it('a frozen batch rejects every later operation in the same session', () => {
+    const { store, id } = ambiguousStore()
+    store.startCounting(id)
+
+    const lineId = store.getSnapshot().batches[0].lines[0].id
+    for (const blocked of [
+      store.startCounting(id),
+      store.recordCount(id, lineId, 5),
+      store.advance(id),
+      store.updateDraft(id, { name: '改名', lines }),
+      store.deleteBatch(id),
+    ]) {
+      expect(blocked.ok).toBe(false)
+      expect(blocked.ruleError?.code).toBe('AMBIGUOUS_COMMIT')
+    }
+    // The last good version is unchanged.
+    expect(store.getSnapshot().batches[0].status).toBe('draft')
+  })
+
+  it('refresh isolates the unconfirmed counting batch instead of silently loading it', () => {
+    const { storage, id } = ambiguousStore2()
+    const refreshed = new InventoryStore(
+      new InventoryRepository(new FakeStorage(storage.dump())),
+    )
+    refreshed.load()
+    const snap = refreshed.getSnapshot()
+    expect(snap.batches).toHaveLength(0) // unconfirmed push is not the truth
+    expect(snap.quarantined).toHaveLength(1)
+    expect(snap.quarantined[0].reason).toBe('ambiguous_commit')
+    expect(snap.quarantined[0].resolution?.batchId).toBe(id)
+  })
+
+  it('after reverting to the draft, counting can be performed against the correct stage', () => {
+    const { storage } = ambiguousStore2()
+    const repoStorage = new FakeStorage(storage.dump())
+    const store = new InventoryStore(new InventoryRepository(repoStorage))
+    store.load()
+    const entry = store.getSnapshot().quarantined[0]
+
+    const reverted = store.resolveAmbiguous(entry, 'revert')
+    expect(reverted.ok).toBe(true)
+    const snap = store.getSnapshot()
+    expect(snap.quarantined).toHaveLength(0)
+    expect(snap.batches).toHaveLength(1)
+    expect(snap.batches[0].status).toBe('draft')
+
+    // Later operations are now based on the same record the page showed.
+    const id = snap.batches[0].id
+    expect(store.startCounting(id).ok).toBe(true)
+    expect(store.getSnapshot().batches[0].status).toBe('counting')
+    const [l1, l2] = store.getSnapshot().batches[0].lines
+    store.recordCount(id, l1.id, 5)
+    store.recordCount(id, l2.id, 7)
+    expect(store.advance(id).ok).toBe(true) // no diffs -> completed
+    expect(store.getSnapshot().batches[0].status).toBe('completed')
+
+    // And the committed, verified state is what a subsequent refresh loads.
+    const again = new InventoryStore(
+      new InventoryRepository(new FakeStorage(repoStorage.dump())),
+    )
+    again.load()
+    expect(again.getSnapshot().quarantined).toHaveLength(0)
+    expect(again.getSnapshot().batches[0].status).toBe('completed')
+  })
+
+  it('after adopting the counting version, counting continues from that stage', () => {
+    const { storage } = ambiguousStore2()
+    const repoStorage = new FakeStorage(storage.dump())
+    const store = new InventoryStore(new InventoryRepository(repoStorage))
+    store.load()
+    const entry = store.getSnapshot().quarantined[0]
+
+    expect(store.resolveAmbiguous(entry, 'adopt').ok).toBe(true)
+    const batch = store.getSnapshot().batches[0]
+    expect(batch.status).toBe('counting')
+
+    const [l1, l2] = batch.lines
+    expect(store.recordCount(batch.id, l1.id, 6).ok).toBe(true)
+    expect(store.recordCount(batch.id, l2.id, 7).ok).toBe(true)
+    expect(store.advance(batch.id).ok).toBe(true)
+    expect(store.getSnapshot().batches[0].status).toBe('review_required')
+
+    const again = new InventoryStore(
+      new InventoryRepository(new FakeStorage(repoStorage.dump())),
+    )
+    again.load()
+    expect(again.getSnapshot().batches[0].status).toBe('review_required')
+  })
+})
+
+/**
+ * Seed the failing push through a real store and return the underlying bytes,
+ * exactly as a crashed tab would leave them for the next refresh.
+ */
+function ambiguousStore2(): { storage: FakeStorage; id: string } {
+  const storage = new FakeStorage()
+  const seed = new InventoryStore(new InventoryRepository(storage))
+  seed.load()
+  const created = seed.createBatch({ name: '验收', lines })
+  expect(created.ok).toBe(true)
+  const id = created.id!
+
+  const liveKey = `${STORAGE_PREFIX}${id}`
+  let landed = false
+  const broken: StorageLike = {
+    getItem: (key) => (key === liveKey && landed ? null : storage.getItem(key)),
+    setItem: (key, value) => {
+      if (key === liveKey) {
+        if (landed) throw quotaError()
+        storage.setItem(key, value)
+        landed = true
+      } else {
+        storage.setItem(key, value)
+      }
+    },
+    removeItem: (key) => storage.removeItem(key),
+    keys: () => storage.keys(),
+  }
+  const store = new InventoryStore(new InventoryRepository(broken))
+  store.load()
+  const result = store.startCounting(id)
+  expect(result.storageError?.indoubt).toBe(true)
+  return { storage, id }
+}

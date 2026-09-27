@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { QUARANTINE_REASON_LABEL } from './types'
+import { QUARANTINE_REASON_LABEL, STATUS_LABEL } from './types'
 import { useInventoryStore, type InventoryStore } from './store'
 import { BatchList } from './components/BatchList'
 import { BatchDetail } from './components/BatchDetail'
@@ -57,14 +57,59 @@ export function InventoryPage({ store }: InventoryPageProps) {
 
       {snapshot.failure && (
         <div className="banner banner-error" role="alert">
-          <strong>{snapshot.failure.quota ? '本地存储容量不足' : '写入失败'}</strong>
-          <span>{snapshot.failure.message}。界面仍显示最后成功保存的版本。</span>
+          <strong>
+            {snapshot.failure.indoubt
+              ? '提交结果存疑，批次已冻结'
+              : snapshot.failure.quota
+                ? '本地存储容量不足'
+                : '写入失败'}
+          </strong>
+          <span>
+            {snapshot.failure.message}
+            {!snapshot.failure.indoubt && '。界面仍显示最后成功保存的版本。'}
+          </span>
           <div className="actions">
-            <button type="button" className="primary" onClick={() => actions.retry()}>
-              重试本次写入
-            </button>
-            <button type="button" onClick={() => actions.dismissFailure()}>
-              放弃并重试稍后
+            {snapshot.failure.indoubt ? (
+              <>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => actions.reloadAfterAmbiguity()}
+                >
+                  重新载入并处理
+                </button>
+                <button type="button" onClick={() => actions.dismissFailure()}>
+                  暂不处理（该批次仍保持冻结）
+                </button>
+              </>
+            ) : (
+              <>
+                <button type="button" className="primary" onClick={() => actions.retry()}>
+                  重试本次写入
+                </button>
+                <button type="button" onClick={() => actions.dismissFailure()}>
+                  放弃并重试稍后
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {snapshot.indoubtBatches.length > 0 && !snapshot.failure?.indoubt && (
+        <div className="banner banner-warn" role="alert">
+          <span>
+            有 {snapshot.indoubtBatches.length}{' '}
+            个批次上次提交结果无法确认，已在本次会话中冻结（不可计数、不可推进）；
+            重新载入后可在隔离提示中选择采用新版本或回退。
+          </span>
+          <div className="actions">
+            <button
+              type="button"
+              className="primary"
+              onClick={() => actions.reloadAfterAmbiguity()}
+            >
+              重新载入并处理
             </button>
           </div>
         </div>
@@ -74,13 +119,38 @@ export function InventoryPage({ store }: InventoryPageProps) {
         <div className="banner banner-warn" role="alert">
           <p>
             发现 {snapshot.quarantined.length}{' '}
-            条损坏或不兼容的记录，已隔离，不影响其他批次盘点：
+            条损坏、不兼容或提交结果存疑的记录，已隔离，不影响其他批次盘点：
           </p>
           <ul className="quarantine-list">
             {snapshot.quarantined.map((entry) => (
               <li key={entry.storageKey}>
                 <code>{entry.storageKey}</code> · {QUARANTINE_REASON_LABEL[entry.reason]} ·{' '}
                 {entry.detail}
+                {entry.resolution && (
+                  <span className="actions">
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => actions.resolveAmbiguous(entry, 'adopt')}
+                      title="确认采用这次未确认提交的新版本（如：盘点中）"
+                    >
+                      采用新版本
+                      {entry.resolution.candidateStatus
+                        ? `（${STATUS_LABEL[entry.resolution.candidateStatus]}）`
+                        : ''}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => actions.resolveAmbiguous(entry, 'revert')}
+                      title="放弃这次提交，恢复到最后成功保存的版本"
+                    >
+                      回退上一版本
+                      {entry.resolution.previousStatus
+                        ? `（${STATUS_LABEL[entry.resolution.previousStatus]}）`
+                        : ''}
+                    </button>
+                  </span>
+                )}
               </li>
             ))}
           </ul>

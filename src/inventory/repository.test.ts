@@ -208,7 +208,168 @@ describe('repository — commit protocol', () => {
     repo.remove(batches[0].id)
     expect(repo.load().batches).toHaveLength(0)
   })
+
+  it('COMMIT verify failure + failed rollback: flags ambiguous and keeps evidence', () => {
+    const storage = new FakeStorage()
+    const repo = new InventoryRepository(storage)
+    let batches = makeBatch()
+    repo.commit(batches[0]) // draft committed
+    batches = startCounting(batches, batches[0].id)
+    const liveKey = `${STORAGE_PREFIX}${batches[0].id}`
+    const stageKey = `${liveKey}::stage`
+
+    // After the live write lands, every read returns null and every further
+    // live write (the rollback) throws: the commit result is unverifiable.
+    let landed = false
+    const broken: StorageLike = {
+      getItem: (key) => (key === liveKey && landed ? null : storage.getItem(key)),
+      setItem: (key, value) => {
+        if (key === liveKey) {
+          if (landed) throw quotaError() // rollback write fails
+          storage.setItem(key, value)
+          landed = true
+        } else {
+          storage.setItem(key, value)
+        }
+      },
+      removeItem: (key) => storage.removeItem(key),
+      keys: () => storage.keys(),
+    }
+    const brokenRepo = new InventoryRepository(broken)
+
+    let err: unknown
+    try {
+      brokenRepo.commit(batches[0])
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(StorageWriteError)
+    expect((err as StorageWriteError).stage).toBe('commit')
+    expect((err as StorageWriteError).indoubt).toBe(true)
+
+    // The unconfirmed candidate physically landed...
+    const raw = JSON.parse(storage.getItem(liveKey)!)
+    expect(raw.committed).toBe(true)
+    expect(raw.batch.status).toBe('counting')
+    // ...and durable evidence survives next to it.
+    const evidence = JSON.parse(storage.getItem(stageKey)!)
+    expect(evidence.committed).toBe(false)
+    expect(evidence.indoubt).toBe(true)
+    expect(typeof evidence.previousRaw).toBe('string')
+    const previous = JSON.parse(evidence.previousRaw)
+    expect(previous.batch.status).toBe('draft')
+  })
+
+  it('refresh after an ambiguous push isolates the unconfirmed batch instead of loading it', () => {
+    const { storage, id } = seedAmbiguous()
+
+    // A healthy new tab loads the same bytes: the candidate that landed must
+    // NOT silently become the effective batch.
+    const fresh = new InventoryRepository(new FakeStorage(storage.dump())).load()
+    expect(fresh.batches).toHaveLength(0)
+    expect(fresh.quarantined).toHaveLength(1)
+    const entry = fresh.quarantined[0]
+    expect(entry.reason).toBe('ambiguous_commit')
+    expect(entry.storageKey).toBe(`${STORAGE_PREFIX}${id}`)
+    expect(entry.resolution?.kind).toBe('ambiguous_commit')
+    expect(entry.resolution?.batchId).toBe(id)
+    expect(entry.resolution?.candidateStatus).toBe('counting')
+    expect(entry.resolution?.previousStatus).toBe('draft')
+  })
+
+  it('ambiguous push can be explicitly adopted, after which refresh loads counting', () => {
+    const { storage, id } = seedAmbiguous()
+    const repoStorage = new FakeStorage(storage.dump())
+    const repo = new InventoryRepository(repoStorage)
+    const entry = repo.load().quarantined[0]
+
+    const adopted = repo.resolveAmbiguous(entry, 'adopt')
+    expect(adopted?.id).toBe(id)
+    expect(adopted?.status).toBe('counting')
+
+    const reloaded = new InventoryRepository(new FakeStorage(repoStorage.dump())).load()
+    expect(reloaded.quarantined).toHaveLength(0)
+    expect(reloaded.batches).toHaveLength(1)
+    expect(reloaded.batches[0].status).toBe('counting')
+    expect(repoStorage.hasStageFor(id)).toBe(false)
+  })
+
+  it('ambiguous push can be explicitly reverted, after which refresh loads the draft', () => {
+    const { storage, id } = seedAmbiguous()
+    const repoStorage = new FakeStorage(storage.dump())
+    const repo = new InventoryRepository(repoStorage)
+    const entry = repo.load().quarantined[0]
+
+    const reverted = repo.resolveAmbiguous(entry, 'revert')
+    expect(reverted).toBeNull()
+
+    const reloaded = new InventoryRepository(new FakeStorage(repoStorage.dump())).load()
+    expect(reloaded.quarantined).toHaveLength(0)
+    expect(reloaded.batches).toHaveLength(1)
+    expect(reloaded.batches[0].id).toBe(id)
+    expect(reloaded.batches[0].status).toBe('draft')
+    expect(repoStorage.hasStageFor(id)).toBe(false)
+  })
+
+  it('indoubt evidence is auto-cleared when the live bytes provably equal the previous version', () => {
+    const { storage, id, previousRaw } = seedAmbiguous()
+    // Simulate that the rollback actually durably restored the old bytes,
+    // even though the original tab could not verify it (hijacked reads).
+    storage.setItem(`${STORAGE_PREFIX}${id}`, previousRaw)
+
+    const repoStorage = new FakeStorage(storage.dump())
+    const reloaded = new InventoryRepository(repoStorage).load()
+    expect(reloaded.quarantined).toHaveLength(0)
+    expect(reloaded.batches).toHaveLength(1)
+    expect(reloaded.batches[0].status).toBe('draft')
+    expect(repoStorage.hasStageFor(id)).toBe(false)
+  })
+
+  it('indoubt evidence with a missing live record auto-restores the previous version', () => {
+    const { storage, id } = seedAmbiguous()
+    storage.removeItem(`${STORAGE_PREFIX}${id}`)
+
+    const repoStorage = new FakeStorage(storage.dump())
+    const reloaded = new InventoryRepository(repoStorage).load()
+    expect(reloaded.quarantined).toHaveLength(0)
+    expect(reloaded.batches).toHaveLength(1)
+    expect(reloaded.batches[0].status).toBe('draft')
+    expect(repoStorage.hasStageFor(id)).toBe(false)
+  })
 })
+
+/**
+ * Seed the exact reported failure: draft -> counting push whose read-back
+ * verification fails while the candidate physically landed, and whose
+ * rollback cannot be verified. Returns the raw bytes a refresh would see.
+ */
+function seedAmbiguous(): { storage: FakeStorage; id: string; previousRaw: string } {
+  const storage = new FakeStorage()
+  let batches = makeBatch()
+  new InventoryRepository(storage).commit(batches[0])
+  const id = batches[0].id
+  const liveKey = `${STORAGE_PREFIX}${id}`
+  const previousRaw = storage.getItem(liveKey)!
+  batches = startCounting(batches, id)
+
+  let landed = false
+  const broken: StorageLike = {
+    getItem: (key) => (key === liveKey && landed ? null : storage.getItem(key)),
+    setItem: (key, value) => {
+      if (key === liveKey) {
+        if (landed) throw quotaError()
+        storage.setItem(key, value)
+        landed = true
+      } else {
+        storage.setItem(key, value)
+      }
+    },
+    removeItem: (key) => storage.removeItem(key),
+    keys: () => storage.keys(),
+  }
+  expect(() => new InventoryRepository(broken).commit(batches[0])).toThrow(StorageWriteError)
+  return { storage, id, previousRaw }
+}
 
 describe('repository — load validation & quarantine', () => {
   function put(storage: FakeStorage, id: string, raw: string) {
